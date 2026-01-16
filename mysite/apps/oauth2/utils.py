@@ -6,7 +6,7 @@ from typing import Optional, Dict
 import jwt
 import logging
 from django.conf import settings
-from apps.account.models import CustomUser
+from apps.user.models import CustomUser
 from .redis_client import get_redis_client
 
 
@@ -71,104 +71,6 @@ def generate_jwt_tokens(user: CustomUser) -> Dict[str, str]:
         'refresh_token': refresh_token
     }
 
-def verify_access_token(token: str) -> Optional[Dict]:
-    """
-    Access Token을 검증하고 페이로드를 반환합니다.
-
-    Args:
-        token: Access Token 문자열
-
-    Returns:
-        dict: 토큰 페이로드 (검증 성공 시), None (실패 시)
-    """
-    try:
-        payload = jwt.decode(
-            token,
-            settings.SECRET_KEY,
-            algorithms=['HS256']
-        )
-
-        # 토큰 타입 확인
-        if payload.get('type') != 'access':
-            return None
-
-        return payload
-    except jwt.ExpiredSignatureError:
-        logger.debug("Access Token이 만료되었습니다.")
-    except jwt.InvalidTokenError as e:
-        logger.debug(f"Access Token이 유효하지 않습니다: {e}")
-
-def verify_refresh_token(refresh_token: str) -> Optional[Dict]:
-    try:
-        payload = jwt.decode(
-            refresh_token,
-            settings.SECRET_KEY,
-            algorithms=['HS256']
-        )
-
-        if payload.get("type") != "refresh":
-            return None
-
-        user_id = payload["user_id"]
-
-        redis = get_redis_client()
-        redis_key = f"jwt:refresh:{user_id}"
-        stored_token = redis.get(redis_key)
-
-        # Redis에 없거나 불일치 -> 무효
-        if not stored_token or stored_token != refresh_token:
-            logger.warning("Redis Refresh Token 불일치 또는 없음")
-            return None
-        return payload
-
-    except jwt.ExpiredSignatureError:
-        logger.debug("Refresh Token이 만료되었습니다.")
-    except jwt.InvalidTokenError as e:
-        logger.debug(f"Refresh Token이 유효하지 않습니다: {e}")
-    return None
-
-def refresh_access_token(refresh_token: str) -> Optional[Dict[str, str]]:
-    """
-    Refresh Token을 사용하여 새로운 Access Token을 발급합니다.
-
-    Args:
-        refresh_token: Refresh Token 문자열
-
-    Returns:
-        dict: {'access_token': str, 'refresh_token': str} (성공 시), None (실패 시)
-    """
-    # Refresh Token 검증
-    payload = verify_refresh_token(refresh_token)
-
-    if not payload:
-        return None
-
-    # 사용자 조회
-    try:
-        user = CustomUser.objects.get(id=payload['user_id'])
-    except CustomUser.DoesNotExist:
-        return None
-
-    # 기존 Refresh Token 삭제
-    try:
-        redis = get_redis_client()
-        redis_key = f"jwt:refresh:{user.id}"
-        redis.delete(redis_key)
-    except Exception:
-        pass
-
-    # 새로운 토큰 생성
-    return generate_jwt_tokens(user)
-
-def logout(user_id: int) -> bool:
-    try:
-        redis = get_redis_client()
-        redis_key = f"jwt:refresh:{user_id}"
-        redis.delete(redis_key)
-        return True
-    except Exception as e:
-        logger.error(f"로그아웃 처리 중 오류 발생: {e}")
-        return False
 
 def get_user_from_access_token(token: str) -> Optional[CustomUser]:
     """

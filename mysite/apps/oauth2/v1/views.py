@@ -1,20 +1,19 @@
 from django.conf import settings                         # OAuth2 설정값 사용
-from django.http import JsonResponse                     # JSON 응답 반환                     # 클래스 기반 뷰
+from django.http import JsonResponse, HttpResponseRedirect # JSON 응답 반환                     # 클래스 기반 뷰
 from django.utils.decorators import method_decorator     # 메서드에 데코레이터 적용
 from django.views.decorators.csrf import csrf_exempt     # CSRF 검증 비활성화
 from typing import Optional                              # 타입 헌팅
+import secrets
+from urllib.parse import urlencode
 
 from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiResponse
 from rest_framework import permissions
 from rest_framework.views import APIView
 
-from apps.account.models import CustomUser               # 프로젝트의 커스텀 사용자 모델
+from apps.user.models import CustomUser               # 프로젝트의 커스텀 사용자 모델
 from .serializers import *
 from ..utils import (
-    generate_jwt_tokens,
-    refresh_access_token,
-    verify_refresh_token,
-    logout,
+    generate_jwt_tokens
 )
 
 import requests  # OAuth2 서버와 HTTP 통신
@@ -23,341 +22,194 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# 클래서 테코레이터.
-# CSRF 비활성화
-# 클라이언트에서 POST 요청 시 CSRF 토큰 없이 호출 가능
-@method_decorator(csrf_exempt, name='dispatch')
-class CallbackView(APIView):
+
+# ------------------------------------------------------------
+# 1) OAuth 시작: 프론트가 POST로 호출 → 서버가 네이버로 리다이렉트
+# ------------------------------------------------------------
+@method_decorator(csrf_exempt, name="dispatch")  # 프론트 POST 리다이렉트 용도로 CSRF 비활성화
+class NaverAuthStartView(APIView):
+    """
+    프론트의 POST 요청을 받아 네이버 OAuth 승인 URL을 생성하고 302 리다이렉트합니다.
+    - 서버가 client_id/redirect_uri/state를 조합합니다.
+    - state는 세션에 저장하여 콜백에서 검증합니다.
+    """
+    
+    @extend_schema(
+            tags=["OAuth2"],
+            summary="네이버 OAuth 시작: 승인 URL 생성 후 302 리다이렉트",
+            description="프론트의 POST 요청을 받아 서버가 state 발급 및 승인 URL을 구성, 네이버 인증 화면으로 리다이렉트합니다.",
+            examples=[OpenApiExample("시작", value={}, request_only=True)],
+            responses={302: OpenApiResponse(description="Redirect to Naver OAuth")}
+        )
+    def get(self, request, *args, **kwargs):
+        # CSRF 방지용 state 생성 및 세션에 저장
+        state = secrets.token_urlsafe(32)
+        request.session["oauth_state"] = state
+
+        # 네이버 authorize URL 구성
+        params = {
+            "response_type": "code",
+            "client_id": settings.OAUTH2_CLIENT_ID,
+            "redirect_uri": settings.OAUTH2_REDIRECT_URI,  # 네이버 콘솔 등록값과 정확히 일치해야 합니다.
+            "state": state,
+        }
+        authorize_url = f"https://nid.naver.com/oauth2.0/authorize?{urlencode(params)}"
+
+        # 브라우저를 네이버 로그인/동의 화면으로 이동
+        return HttpResponseRedirect(authorize_url)
+
+
+# ------------------------------------------------------------
+# 2) 콜백: 네이버가 GET으로 code/state를 전달 → 서버가 토큰 교환 후 JWT 발급
+# ------------------------------------------------------------
+class NaverCallbackView(APIView):
+    """
+    네이버 콜백 엔드포인트 (GET)
+    - 쿼리 스트링으로 전달되는 code/state를 읽습니다.
+    - state를 세션에 저장된 값과 검증합니다.
+    - code로 토큰 교환 → access_token으로 사용자 정보 조회 → 내부 사용자 upsert → 자체 JWT 발급
+    - JSON 바디로 access_token/refresh_token을 반환합니다.
+    """
     permission_classes = [permissions.AllowAny]
 
-    # OAuth2 인증 코드를 받아 처리하는 메인 로직
+    
     @extend_schema(
-        tags=["OAuth2"],
-        summary="OAuth2 콜백: 인증 코드로 토큰 교환 및 사용자 생성/조회",
-        description=(
-                "OAuth2 provider로부터 받은 authorization code와 optional state를 받아 "
-                "프로바이더 액세스 토큰을 교환하고 사용자 정보를 조회한 뒤, 애플리케이션의 JWT 토큰을 발급합니다. "
-                "state는 문자열(JSON string) 또는 객체(redirect_url 포함)로 올 수 있습니다."
-        ),
-        request=OAuthCallbackRequestSerializer,
-        responses={
-            200: OAuthCallbackResponseSerializer,
-            400: BadRequestSerializer,
-            401: UnauthorizedSerializer,
-            500: ServerErrorSerializer,
-        },
-        examples=[
-            OpenApiExample(
-                name="state가 객체로 전달되는 경우",
-                value={"code": "AUTH_CODE_123", "state": {"redirect_url": "https://app.example.com/after-login"}},
-                request_only=True,
+            tags=["OAuth2"],
+            summary="네이버 OAuth 콜백: code 교환 → 프로필 조회 → JWT 발급(JSON)",
+            description=(
+                "네이버가 전달한 code/state를 검증하고 access_token을 교환 후 "
+                "프로필을 조회, 내부 사용자 upsert 및 JWT(access/refresh)를 JSON 바디로 반환합니다."
             ),
-            OpenApiExample(
-                name="state가 문자열(JSON)로 전달되는 경우",
-                value={"code": "AUTH_CODE_123", "state": "{\"redirect_url\":\"https://app.example.com/after-login\"}"},
-                request_only=True,
-            ),
-            OpenApiExample(
-                name="성공 응답",
-                value={
-                    "email": "user@example.com",
-                    "userName": "홍길동",
-                    "access_token": "jwt-access-token",
-                    "refresh_token": "jwt-refresh-token",
-                    "redirect_url": "https://app.example.com/after-login",
-                },
-                response_only=True,
-            ),
-        ],
-        # 글로벌 보안 스키마가 있다면 콜백은 인증 없이 접근 가능하도록 비워줍니다.
-        operation_id="oauth2_callback",
-    )
-    def post(self, request, *args, **kwargs):
-        try:
-            # 요청 본문을 JSON으로 파싱
-            data = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({"message" : "JSON 디코딩 에러"}, status=400)
-
-        # 요청 데이터 추출
-        code = data.get("code", "")    # OAuth2 인증 코드
-        state = data.get("state", {})  # 추가 정보 포함
-        if not code:
-            return JsonResponse({"message": "code 정보 인식 실패"}, status=400)
-
-        # state가 문자열이라면 JSON 반환
-        if isinstance(state, str):
-            try:
-                state_json = json.loads(state)
-            except json.JSONDecodeError:
-                return JsonResponse({"message": "state JSON 디코딩 에러"}, status=400)
-
-        else:
-            state_json = state
-
-        # redirect_url 추출
-        redirect_url = state_json.get("redirect_url", "")
-
-        # 1. 엑세스 토큰 요청
-        # 인증 코드를 엑세스 토큰으로 교환
-        access_token = self.request_access_token(code)
-
-        if not access_token:
-            logger.error("OAuth2 액세스 토큰 요청 실패")
-            return JsonResponse({"message": "액세스 토큰 요청 실패"}, status = 401)
-
-        # 2. 사용자 정보 요청
-        user_info = self.request_user_info(access_token)
-        if not user_info:
-            logger.error("OAuth2 사용자 정보 요청 실패")
-            return JsonResponse({"message": "사용자 정보 요청 실패"}, status=400)
-
-        email = user_info.get("email", "")
-        name = user_info.get("name", "")
-
-        if not email:
-            return JsonResponse({"message": "이메일 정보 추출 실패"}, status=401)
-
-        # 3. 사용자 존재 여부 확인
-        user = self.get_or_create_user(email, name)
-        if user is None:
-            logger.error(f"사용자 생성/조회 실패: {email}")
-            return JsonResponse({"message": "사용자 생성 실패"}, status=500)
-
-        # 4. JWT 토큰 생성
-        tokens = generate_jwt_tokens(user)
-        if not tokens:
-            logger.error(f"JWT 토큰 생성 실패: {email}")
-            return JsonResponse({"message": "토큰 생성 실패"}, status=500)
-
-        # 5. 사용자 정보 반환
-        response_data = {
-            "email": email,
-            "userName": name or user.username or "",
-            "access_token": tokens["access_token"],
-            "refresh_token": tokens["refresh_token"],
-            "redirect_url": redirect_url,
-        }
-
-        return JsonResponse(response_data, safe=False)
-
-    def request_access_token(self, code: str) -> Optional[str]:
-        """OAuth2 인증 코드를 액세스 토큰으로 교환"""
-        token_data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": settings.OAUTH2_REDIRECT_URI,
-            "client_id": settings.OAUTH2_CLIENT_ID,
-            "client_secret": settings.OAUTH2_CLIENT_SECRET,
-        }
-
-        try:
-            response = requests.post(settings.OAUTH2_TOKEN_ENDPOINT, data=token_data, timeout=10)
-            if response.status_code == 200:
-                return response.json().get("access_token")
-            else:
-                logger.error(f"OAuth2 토큰 요청 실패: {response.status_code} - {response.text}")
-        except requests.RequestException as e:
-            logger.error(f"OAuth2 토큰 요청 중 예외 발생: {str(e)}")
-
-        return None
-
-    def request_user_info(self, access_token: str) -> Optional[dict]:
-        """액세스 토큰을 사용하여 사용자 정보 조회"""
-        headers = {"Authorization": f"Bearer {access_token}"}
-        response = requests.get(settings.OAUTH2_USER_INFO_ENDPOINT, headers=headers)
-
-        if response.status_code == 200:
-            data = response.json()
-            profile = data.get("response", {})
-
-            email = profile.get("email")
-            name = profile.get("name")
-
-            return {"email": email, "name": name}
-
-        return None
-
-    def get_or_create_user(self, email: str, name: str) -> Optional[CustomUser]:
-        """사용자 조회 또는 생성 (CustomUser 사용)"""
-        try:
-            # 이메일로 사용자 조회
-            user = CustomUser.objects.get(email=email)
-            # 사용자명이 업데이트되지 않은 경우 업데이트
-            if name and not user.username:
-                user.username = name
-                user.save(update_fields=['username'])
-            return user
-        except CustomUser.DoesNotExist:
-            # 사용자가 없으면 생성 (OAuth2 로그인이므로 비밀번호 없음)
-            try:
-                user = CustomUser.objects.create_user(
-                    email=email,
-                    username=name or email.split("@")[0],
-                    password=None  # OAuth2 인증이므로 비밀번호 없음
+            responses={
+                200: OpenApiResponse(description="로그인 성공 / JWT 반환"),
+                400: OpenApiResponse(description="요청 파라미터/프로필 오류"),
+                401: OpenApiResponse(description="토큰 교환 실패 또는 이메일 미제공"),
+                403: OpenApiResponse(description="state 불일치"),
+                500: OpenApiResponse(description="서버 내부 오류"),
+            },
+            examples=[
+                OpenApiExample(
+                    "성공 응답",
+                    value={
+                        "email": "user@example.com",
+                        "userName": "홍길동",
+                        "access_token": "jwt-access",
+                        "refresh_token": "jwt-refresh",
+                    },
+                    response_only=True
+                ),
+                OpenApiExample(
+                    "이메일 미제공",
+                    value={"message": "email_missing", "next": "/api/oauth2/email-auth"},
+                    response_only=True
                 )
-                user.set_unusable_password()  # 비밀번호를 사용할 수 없도록 설정
-                user.save()
-                logger.info(f"새 사용자 생성: {email}")
-                return user
-            except Exception as e:
-                logger.error(f"사용자 생성 중 예외 발생: {str(e)}")
-                return None
-        except Exception as e:
-            logger.error(f"사용자 조회 중 예외 발생: {str(e)}")
-            return None
+            ]
+        )
+    def get(self, request, *args, **kwargs):
+        code = request.GET.get("code")
+        state = request.GET.get("state")
 
+        if not code or not state:
+            return JsonResponse({"message": "missing code/state"}, status=400)
 
-@method_decorator(csrf_exempt, name="dispatch")
-class RefreshTokenView(APIView):
-    """Refresh Token을 사용하여 새로운 Access Token 발급"""
+        # 1) state 검증
+        saved_state = request.session.pop("oauth_state", None)
+        if not saved_state or saved_state != state:
+            return JsonResponse({"message": "invalid_state"}, status=403)
 
-    @extend_schema(
-        tags=["OAuth2"],
-        summary="Refresh Token으로 새로운 Access Token 발급",
-        request=RefreshTokenRequestSerializer,
-        responses={
-            200: OpenApiResponse(TokenPairSerializer, description="새 토큰 쌍 발급"),
-            400: OpenApiResponse(MessageSerializer, description="요청 형식 오류"),
-            401: OpenApiResponse(MessageSerializer, description="유효하지 않은 refresh_token"),
-        },
-        examples=[
-            OpenApiExample(
-                "요청 예시",
-                value={"refresh_token": "your-refresh-token"},
-                request_only=True,
-            ),
-            OpenApiExample(
-                "성공 응답",
-                value={"access_token": "new-access", "refresh_token": "new-refresh"},
-                response_only=True,
-            ),
-        ],
-        operation_id="auth_refresh",
-    )
-    def post(self, request, *args, **kwargs):
-        try:
-            data = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({"message": "JSON 디코딩 에러"}, status=400)
+        # 2) code → token 교환
+        access_token = self._exchange_code_for_access_token(code)
+        if not access_token:
+            return JsonResponse({"message": "token_exchange_failed"}, status=401)
 
-        refresh_token = data.get("refresh_token", "")
+        # 3) 사용자 정보 조회 (네이버 /v1/nid/me)
+        profile = self._fetch_naver_profile(access_token)
+        if not profile:
+            return JsonResponse({"message": "profile_request_failed"}, status=400)
 
-        if not refresh_token:
-            return JsonResponse({"message": "refresh_token이 필요합니다"}, status=400)
+        # 네이버 표준 응답 형태 처리
+        if profile.get("resultcode") != "00":
+            return JsonResponse({"message": "invalid_profile_response"}, status=400)
 
-        # Refresh Token으로 새로운 토큰 발급
-        tokens = refresh_access_token(refresh_token)
-
-        if not tokens:
-            return JsonResponse({"message": "유효하지 않은 refresh_token입니다"}, status=401)
-
-        return JsonResponse({
-            "access_token": tokens["access_token"],
-            "refresh_token": tokens["refresh_token"],
-        }, safe=False)
-
-
-@method_decorator(csrf_exempt, name="dispatch")
-class EmailAuthView(APIView):
-    """이메일 기반 사용자 인증 및 JWT 토큰 발급"""
-
-    @extend_schema(
-        tags=["OAuth2"],
-        summary="이메일로 사용자 인증 및 JWT 발급",
-        request=EmailAuthRequestSerializer,
-        responses={
-            200: OpenApiResponse(EmailAuthResponseSerializer, description="인증 성공 및 토큰 발급"),
-            400: OpenApiResponse(MessageSerializer, description="요청 형식 오류/유효하지 않은 이메일"),
-            403: OpenApiResponse(MessageSerializer, description="등록되지 않은 사용자"),
-            500: OpenApiResponse(MessageSerializer, description="토큰 생성 실패"),
-        },
-        examples=[
-            OpenApiExample("요청 예시", value={"email": "user@example.com"}, request_only=True),
-            OpenApiExample(
-                "성공 응답",
-                value={
-                    "message": "사용자 인증 완료",
-                    "email": "user@example.com",
-                    "userName": "홍길동",
-                    "access_token": "jwt-access-token",
-                    "refresh_token": "jwt-refresh-token",
-                },
-                response_only=True,
-            ),
-        ],
-        operation_id="auth_email",
-    )
-    def post(self, request, *args, **kwargs):
-        try:
-            data = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({"message": "JSON 디코딩 에러"}, status=400)
-
-        email = data.get("email", "")
+        resp = profile.get("response", {}) or {}
+        email = resp.get("email")
+        name = resp.get("name")
+        naver_id = resp.get("id")
 
         if not email:
-            return JsonResponse({"message": "이메일이 필요합니다"}, status=400)
+            return JsonResponse({"message": "email_missing", "next": "/api/oauth2/email-auth"}, status=401)
 
-        # 이메일 형식 검증 (간단한 검증)
-        if "@" not in email:
-            return JsonResponse({"message": "유효하지 않은 이메일 형식입니다"}, status=400)
-
+        # 4) 내부 사용자 upsert/매핑
         try:
-            user = CustomUser.objects.get(email=email)
+            user, created = CustomUser.objects.get_or_create(
+                email=email,
+                defaults={"username": name or (email.split("@")[0] if "@" in email else email)}
+            )
+            if name and user.username != name:
+                user.username = name
+                user.save(update_fields=["username"])
+        except Exception as e:
+            logger.exception("user upsert failed: %s", e)
+            return JsonResponse({"message": "user_upsert_failed"}, status=500)
 
-        except CustomUser.DoesNotExist:
-            return JsonResponse({"message": "등록되지 않은 사용자입니다. 관리자에게 문의바랍니다."}, status=403)
-
-        # JWT 토큰 생성
+        # 5) 자체 JWT 발급 (이미 사용 중인 util 함수 활용)
         tokens = generate_jwt_tokens(user)
         if not tokens:
-            logger.error(f"JWT 토큰 생성 실패: {email}")
-            return JsonResponse({"message": "토큰 생성 실패"}, status=500)
+            return JsonResponse({"message": "jwt_issue_failed"}, status=500)
 
+        # 6) JSON 반환 
         return JsonResponse({
-            "message": "사용자 인증 완료",
             "email": user.email,
             "userName": user.username or "",
             "access_token": tokens["access_token"],
             "refresh_token": tokens["refresh_token"],
         }, status=200)
 
-
-@method_decorator(csrf_exempt, name="dispatch")
-class LogoutView(APIView):
-    """로그아웃 - 토큰 무효화"""
-
-    @extend_schema(
-        tags=["OAuth2"],
-        summary="로그아웃 (Refresh Token 무효화)",
-        request=LogoutRequestSerializer,
-        responses={
-            200: OpenApiResponse(MessageSerializer, description="로그아웃 완료"),
-            400: OpenApiResponse(MessageSerializer, description="요청 형식 오류"),
-            401: OpenApiResponse(MessageSerializer, description="유효하지 않은 refresh_token"),
-        },
-        examples=[
-            OpenApiExample("요청 예시", value={"refresh_token": "your-refresh-token"}, request_only=True),
-            OpenApiExample("성공 응답", value={"message": "로그아웃 완료"}, response_only=True),
-        ],
-        operation_id="auth_logout",
-    )
-    def post(self, request, *args, **kwargs):
+    # --- 내부 헬퍼들 ---
+    def _exchange_code_for_access_token(self, code: str) -> Optional[str]:
+        """
+        네이버 토큰 엔드포인트로 인증 코드 교환하여 access_token을 획득
+        """
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": settings.OAUTH2_CLIENT_ID,
+            "client_secret": settings.OAUTH2_CLIENT_SECRET,
+            "redirect_uri": settings.OAUTH2_REDIRECT_URI,
+        }
         try:
-            data = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({"message": "JSON 디코딩 에러"}, status=400)
+            r = requests.post(
+                settings.OAUTH2_TOKEN_ENDPOINT,  # 예: "https://nid.naver.com/oauth2.0/token"
+                data=token_data,
+                headers={"Accept": "application/json"},
+                timeout=10
+            )
+            if r.status_code != 200:
+                logger.error("token exchange failed: %s %s", r.status_code, r.text)
+                return None
+            j = r.json()
+            if "error" in j:
+                logger.error("token exchange error: %s", j.get("error_description"))
+                return None
+            return j.get("access_token")
+        except requests.RequestException as e:
+            logger.exception("token request exception: %s", e)
+            return None
 
-        refresh_token = data.get("refresh_token", "")
-        if not refresh_token:
-            return JsonResponse({"message": "refresh_token이 필요합니다"}, status=400)
-
-        payload = verify_refresh_token(refresh_token)
-        if not payload:
-            return JsonResponse({"message": "유효하지 않은 refresh_token입니다"}, status=401)
-
-        logout(payload["user_id"])
-        logger.info(f"사용자 로그아웃 완료: {payload['user_id']}")
-
-        return JsonResponse({"message": "로그아웃 완료"}, status=200)
+    def _fetch_naver_profile(self, access_token: str) -> Optional[dict]:
+        """
+        네이버 프로필 API 호출
+        """
+        try:
+            r = requests.get(
+                settings.OAUTH2_USER_INFO_ENDPOINT,  # 예: "https://openapi.naver.com/v1/nid/me"
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                timeout=10
+            )
+            if r.status_code != 200:
+                logger.error("profile request failed: %s %s", r.status_code, r.text)
+                return None
+            return r.json()
+        except requests.RequestException as e:
+            logger.exception("profile request exception: %s", e)
+            return None

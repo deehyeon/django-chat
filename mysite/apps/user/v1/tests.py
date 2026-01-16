@@ -1,10 +1,10 @@
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.account.models import Account
+from apps.user.models import User
 
 
-class AccountAPITest(APITestCase):
+class UserAPITest(APITestCase):
     def setUp(self):
         self.user1 = self.create_user("test_user1", "test_password1")
         self.user2 = self.create_user("test_user2", "test_password2")
@@ -16,7 +16,7 @@ class AccountAPITest(APITestCase):
     def test_success_test_cast1(self):
         # anonymous user
         resp = self.client.post(
-            "/api/v1/account/",
+            "/api/v1/user/",
             {
                 "name": "test_name",
             },
@@ -29,7 +29,7 @@ class AccountAPITest(APITestCase):
         # authenticated user
         self.client.force_login(self.user1)
         resp = self.client.post(
-            "/api/v1/account/",
+            "/api/v1/user/",
             {
                 "name": "test_name",
             },
@@ -43,7 +43,7 @@ class AccountAPITest(APITestCase):
         with freeze_time("2025-01-01"):
             self.client.force_login(self.user1)
             resp = self.client.post(
-                "/api/v1/account/",
+                "/api/v1/user/",
                 {
                     "name": "test_name",
                 },
@@ -55,7 +55,7 @@ class AccountAPITest(APITestCase):
     def test_fail_test_cast1(self):
         # anonymous user
         resp = self.client.post(
-            "/api/v1/account/",
+            "/api/v1/user/",
             {
                 "name": "test_name",
             },
@@ -67,7 +67,7 @@ class AccountAPITest(APITestCase):
         # authenticated user
         self.client.force_login(self.user2)
         resp = self.client.post(
-            "/api/v1/account/",
+            "/api/v1/user/",
             {
                 "name": "test_name",
             },
@@ -78,7 +78,7 @@ class AccountAPITest(APITestCase):
     def test_fail_test_cast3(self):
         # raise exception
         resp = self.client.post(
-            "/api/v1/account/",
+            "/api/v1/user/",
             {
                 "name": "test_name",
             },
@@ -90,7 +90,7 @@ class AccountAPITest(APITestCase):
         # exception handler
         with self.assertRaises(Exception):
             resp = self.client.post(
-                "/api/v1/account/",
+                "/api/v1/user/",
                 {
                     "name": "test_name",
                 },

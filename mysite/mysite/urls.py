@@ -16,6 +16,7 @@ urlpatterns = [
 
     # Account
     path("api/oauth2/", include("apps.oauth2.v1.urls")),
+    path("api/user/", include("apps.user.v1.urls")),
 
     # Chat
     path("api/chat/", include("apps.chat.urls")),
